@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS files(
     fid             INTEGER,                 -- letzte bekannte file-id im item
     cached          INTEGER DEFAULT 1,       -- 1=GLOBAL gecacht (checkcached) -> re-materialisierbar
     present         INTEGER DEFAULT 1,       -- 1=aktuell im Account vorhanden (mylist) -> mountbar
+    deleted         INTEGER DEFAULT 0,       -- 1=vom User via WebDAV-DELETE gelöscht -> aus Mount ausgeblendet
     last_check      REAL    DEFAULT 0,       -- letzter checkcached-Zeitpunkt
     materialized_at REAL    DEFAULT 0,       -- letzter Re-Add-Zeitpunkt
     PRIMARY KEY (hash, wpath)
@@ -23,7 +24,8 @@ CREATE TABLE IF NOT EXISTS files(
 CREATE INDEX IF NOT EXISTS idx_hash ON files(hash);
 """
 # Spalten, die spaeter dazukamen -> idempotent nachziehen (ALTER ADD COLUMN bei bestehender DB).
-_MIGRATE = ["type TEXT", "folder TEXT", "tid INTEGER", "fid INTEGER", "present INTEGER DEFAULT 1"]
+_MIGRATE = ["type TEXT", "folder TEXT", "tid INTEGER", "fid INTEGER", "present INTEGER DEFAULT 1",
+            "deleted INTEGER DEFAULT 0"]
 
 class Catalog:
     def __init__(self, path):
@@ -103,8 +105,29 @@ class Catalog:
         return self._conn().execute("SELECT * FROM files WHERE cached=1").fetchall()
 
     def all_listed(self):
-        """Im Mount sichtbar: aktuell vorhanden (present) ODER global re-materialisierbar (cached)."""
-        return self._conn().execute("SELECT * FROM files WHERE present=1 OR cached=1").fetchall()
+        """Im Mount sichtbar: aktuell vorhanden (present) ODER global re-materialisierbar (cached),
+        und NICHT vom User gelöscht (deleted)."""
+        return self._conn().execute(
+            "SELECT * FROM files WHERE (present=1 OR cached=1) AND COALESCE(deleted,0)=0").fetchall()
+
+    def mark_deleted(self, hash, wpath):
+        """Blendet eine Datei aus dem Mount aus (WebDAV-DELETE). Gibt True zurück, wenn danach
+        KEINE gelistete Datei dieses Torrents mehr übrig ist — dann ist der TorBox-Torrent löschbar."""
+        c = self._conn()
+        c.execute("UPDATE files SET deleted=1 WHERE hash=? AND wpath=?", (hash, wpath))
+        c.commit()
+        remaining = c.execute(
+            "SELECT COUNT(*) FROM files WHERE hash=? AND (present=1 OR cached=1) "
+            "AND COALESCE(deleted,0)=0", (hash,)).fetchone()[0]
+        return remaining == 0
+
+    def item_for_hash(self, hash):
+        """(type, tid) der letzten bekannten Account-Location für den TorBox-Delete-Call;
+        None wenn keine bekannt. Rows bleiben nach mark_deleted erhalten (nur deleted=1)."""
+        r = self._conn().execute(
+            "SELECT type, tid FROM files WHERE hash=? AND tid IS NOT NULL "
+            "ORDER BY materialized_at DESC LIMIT 1", (hash,)).fetchone()
+        return (r["type"], r["tid"]) if r else None
 
     def sync_present(self, present_hashes):
         """present=1 fuer die uebergebenen Hashes (aktuell in der mylist), present=0 fuer alle anderen."""

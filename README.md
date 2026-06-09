@@ -103,12 +103,11 @@ its auto-scan on the FUSE path (torrg/your-grabber triggers scans).
 
 ## Development
 
-Pure Python 3 standard library at runtime (plus `curl` and `rclone` in the
-container). Tests use `pytest`:
+Pure Python 3 standard library — no dependencies, at runtime or for tests (the
+container also has `curl` and `rclone`). Each `test_*.py` is a standalone script:
 
 ```bash
-pip install -r requirements-dev.txt
-pytest
+for t in test_*.py; do echo "$t"; python3 "$t" || break; done
 ```
 
 `poc.py` is the original single-file proof-of-concept that established CDN-range
