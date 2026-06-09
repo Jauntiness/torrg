@@ -601,7 +601,11 @@ class H(BaseHTTPRequestHandler):
             return self._send(405)
         kind, node = walk(self.path)
         if kind is None:
-            return self._send(404)
+            # Idempotent: ein DELETE auf einen bereits weg-geräumten Pfad -> 204, nicht 404.
+            # Plex/rclone löscht nach der letzten Datei den jetzt leeren Release-Ordner; das
+            # Item ist da schon weg + aus dem Listing genommen -> der Ordner-rmdir trifft None.
+            # 404 würde dem Client fälschlich einen Fehler melden, obwohl das Löschen klappte.
+            return self._send(204)
         if kind == "file":
             h, wp = node.get("hash"), node.get("wpath")
             if not h:
