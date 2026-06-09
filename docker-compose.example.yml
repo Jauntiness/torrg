@@ -1,0 +1,74 @@
+# torrg — self-hosted "zurg for TorBox": exposes your whole TorBox account as a
+# WebDAV filesystem and serves reads via a fast CDN range-proxy (~RD parity,
+# instead of TorBox's slow native WebDAV).
+#
+# Setup:
+#   1. cp .env.example .env   and fill in TORBOX_API_KEY (+ optional WebDAV creds)
+#   2. cp docker-compose.example.yml docker-compose.yml   and adjust the host
+#      paths marked below to your machine
+#   3. docker compose up -d --build
+services:
+  torbox_webdav:
+    build: .
+    image: torrg:local
+    container_name: torrg
+    restart: unless-stopped
+    init: true
+    environment:
+      - TORBOX_API_KEY=${TORBOX_API_KEY}
+      - PORT=8112
+      - REFRESH_SECONDS=900
+      # Fallback to native TorBox WebDAV for files with a stalling CDN URL (creds from .env)
+      - TORBOX_WEBDAV_URL=https://webdav.torbox.app
+      - TORBOX_WEBDAV_USER=${TORBOX_WEBDAV_USER}
+      - TORBOX_WEBDAV_PASS=${TORBOX_WEBDAV_PASS}
+      # LAZY mode: catalog survives expiry, materialize-on-read, probe cache.
+      - LAZY=1
+      - CATALOG_DB=/data/catalog.db
+      - PROBE_DIR=/data/probe        # bind to a cache disk (see volumes), NOT the system disk
+      - PROBE_MAX_MB=32000           # probe-blob cache cap; raise if large headers get evicted
+      # Probe window (lazy-fill safety net): covers Plex's header read (1080p ~6.5MB, 2160p-REMUX ~21MB)
+      - PROBE_HEAD_MB=24
+      - PROBE_TAIL_MB=8
+      # Size model: head = clamp(6 + GB*0.25, 6..24) MB; audio 4/1 MB.
+      - WARM=1                       # proactively warm head+tail per present file (scan-warm the mount)
+      - WARM_MIN_HEAD_MB=6
+      - WARM_HEAD_PER_GB=0.25
+      - WARM_WORKERS=8
+      - ACCESS_LOG=/data/access.log  # scan-range analysis (scan_probe_report.py)
+      - CATEGORIES_CONF=/config/categories.conf  # movies/shows/music split (editable, zurg-style)
+    volumes:
+      - ./data:/data                                   # catalog.db + access.log (small)
+      - /srv/cache/torbox-probe:/data/probe            # <-- ADJUST: probe blobs on a cache disk
+      - ./categories.conf:/config/categories.conf
+    networks: [tbwd]
+
+  torbox_webdav_rclone:
+    image: rclone/rclone:latest
+    container_name: torrg_rclone
+    restart: unless-stopped
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+    volumes:
+      - /srv/media/mnt:/mnt/remote:rshared             # <-- ADJUST: parent of the mount point
+      - ./rclone.conf:/config/rclone/rclone.conf
+      - /srv/cache/torbox-vfs:/cache                   # <-- ADJUST: rclone VFS cache on a cache disk
+    cap_add: [SYS_ADMIN]
+    security_opt: [apparmor:unconfined]
+    devices: [/dev/fuse:/dev/fuse:rwm]
+    depends_on: [torbox_webdav]
+    networks: [tbwd]
+    command: >
+      mount tbwd: /mnt/remote/torbox-fast
+        --uid=1000 --gid=1000 --allow-other --read-only
+        --vfs-cache-mode=full --vfs-cache-max-size=30G --vfs-cache-max-age=24h
+        --buffer-size=0M --vfs-read-ahead=0 --vfs-read-chunk-size=1M
+        --vfs-read-chunk-size-limit=1M --dir-cache-time=15m --cache-dir=/cache
+        --rc --rc-addr=:5572 --rc-no-auth
+        --log-level=INFO
+
+networks:
+  tbwd:
+    driver: bridge

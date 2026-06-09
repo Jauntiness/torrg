@@ -1,0 +1,3 @@
+# Runtime needs only the Python 3 standard library (+ curl & rclone in the container).
+# These are for running the test suite.
+pytest
