@@ -62,6 +62,16 @@ without a cold round-trip.
 A zurg-style, editable `categories.conf` groups content into `movies` / `shows` /
 `music` (and 1080p mirrors), so you can map each to its own Plex library.
 
+### 🗑️ Delete from Plex (opt-in)
+Delete a file straight from the Plex UI and torrg removes it. Because the TorBox
+API only deletes whole items (not single files), torrg **emulates per-file delete**:
+deleting one file hides it from the mount, and only when the *last* file of an item
+is gone does torrg delete the actual TorBox torrent — so removing one episode never
+nukes a whole season pack. Deleting a release folder removes the item directly;
+deleting a category/root folder is refused (mass-delete guard). Requires a
+read-write mount (remove `--read-only` from the rclone command — note this makes the
+whole tree deletable by any WebDAV client).
+
 ## How it works
 
 ```

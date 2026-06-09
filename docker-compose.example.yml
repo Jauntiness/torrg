@@ -60,6 +60,9 @@ services:
     devices: [/dev/fuse:/dev/fuse:rwm]
     depends_on: [torbox_webdav]
     networks: [tbwd]
+    # To enable delete-from-Plex, remove `--read-only` below. torrg then maps a Plex
+    # delete to removing the underlying TorBox item — but the whole tree becomes
+    # deletable by any WebDAV client, so mind your Plex trash/scan settings.
     command: >
       mount tbwd: /mnt/remote/torbox-fast
         --uid=1000 --gid=1000 --allow-other --read-only

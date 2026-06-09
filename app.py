@@ -522,6 +522,58 @@ def propfind_body(path, depth):
     return ('<?xml version="1.0" encoding="utf-8"?>\n<D:multistatus xmlns:D="DAV:">'
             + "".join(parts) + "</D:multistatus>").encode()
 
+# ── WebDAV-DELETE ────────────────────────────────────────────────────────────────────────
+# TorBox kann via API nur GANZE Items löschen (controltorrent op=delete), kein per-file.
+# Per-File-Delete wird emuliert: Datei einzeln im Katalog ausblenden (mark_deleted), den
+# TorBox-Torrent erst löschen, wenn die LETZTE Datei des Torrents weg ist. Ordner-DELETE
+# (ganzer Release) = Torrent direkt. Kategorie-/Root-DELETE wird verweigert (Massen-Schutz).
+TORBOX_CONTROL = {
+    "torrents": ("torrents/controltorrent", "torrent_id"),
+    "usenet":   ("usenet/controlusenetdownload", "usenet_id"),
+    "webdl":    ("webdl/controlwebdownload", "webdl_id"),
+}
+
+def delete_request(type, tid):
+    """(endpoint, json_payload) für den TorBox-Delete-Call eines GANZEN Items. Pure -> testbar."""
+    ep, idkey = TORBOX_CONTROL[type]
+    return ("/" + ep, {idkey: tid, "operation": "delete"})
+
+def files_in_release(node):
+    """node = dir-Knoten aus walk(). Ist es ein RELEASE-Ordner (alle Kinder sind Dateien),
+    gib [(hash, wpath, type, tid), ...]. Sonst (Kategorie/Root mit Unterordnern, oder leer)
+    -> None — verhindert, dass ein Kategorie-/Root-DELETE den ganzen Mount löscht."""
+    if not isinstance(node, dict) or not node:
+        return None
+    children = list(node.values())
+    if not all(isinstance(c, dict) and "wpath" in c for c in children):
+        return None
+    return [(c.get("hash"), c.get("wpath"), c.get("type"), c.get("tid")) for c in children]
+
+def delete_item(type, tid):
+    """Löscht ein ganzes TorBox-Item via curl-JSON-POST (controltorrent op=delete). Best-effort:
+    Fehler werden geloggt, nicht geworfen (z.B. Item schon weg). True bei HTTP 200."""
+    try:
+        path, payload = delete_request(type, tid)
+    except KeyError:
+        log.error(f"delete_item: unbekannter Typ {type}"); return False
+    out = subprocess.run(
+        ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-X", "POST",
+         "-H", f"Authorization: Bearer {API_KEY}", "-H", "Content-Type: application/json",
+         "-d", json.dumps(payload), f"{API}{path}"], capture_output=True, timeout=30)
+    code = out.stdout.decode().strip()
+    ok = code == "200"
+    (log.info if ok else log.warning)(f"TorBox delete {type}#{tid}: HTTP {code}")
+    return ok
+
+def delete_torrent_for_hash(h):
+    """TorBox-Item für hash löschen (über die letzte bekannte Account-Location) + Probes droppen."""
+    if CAT is None:
+        return
+    loc = CAT.item_for_hash(h)
+    if loc and loc[1] is not None:
+        delete_item(loc[0], loc[1])
+    drop_probes_for_hash(h)
+
 # ── HTTP-Handler ───────────────────────────────────────────────────────────────────────
 class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -536,13 +588,40 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         if body and self.command != "HEAD": self.wfile.write(body)
     def do_OPTIONS(self):
-        self._send(200, {"DAV": "1,2", "Allow": "OPTIONS, GET, HEAD, PROPFIND", "MS-Author-Via": "DAV"})
+        self._send(200, {"DAV": "1,2", "Allow": "OPTIONS, GET, HEAD, PROPFIND, DELETE", "MS-Author-Via": "DAV"})
     def do_PROPFIND(self):
         body = propfind_body(self.path, self.headers.get("Depth", "1"))
         if body is None: return self._send(404)
         self._send(207, {"Content-Type": 'application/xml; charset="utf-8"'}, body)
     def do_HEAD(self): self._get(head=True)
     def do_GET(self):  self._get(head=False)
+    def do_DELETE(self):
+        # Per-File-Emulation (siehe TORBOX_CONTROL-Block). Nur sinnvoll mit Katalog (LAZY).
+        if not (LAZY and CAT is not None):
+            return self._send(405)
+        kind, node = walk(self.path)
+        if kind is None:
+            return self._send(404)
+        if kind == "file":
+            h, wp = node.get("hash"), node.get("wpath")
+            if not h:
+                return self._send(409)                 # ohne hash kein Delete-State
+            if CAT.mark_deleted(h, wp):                 # letzte Datei -> ganzen Torrent löschen
+                delete_torrent_for_hash(h)
+            lazy_tree_swap()                            # sofort aus dem Listing nehmen
+            return self._send(204)
+        # Verzeichnis: nur ein RELEASE-Ordner darf gelöscht werden (nicht Kategorie/Root).
+        files = files_in_release(node)
+        if files is None:
+            return self._send(405)                      # Massen-Lösch-Schutz
+        hashes = set()
+        for h, wp, _t, _tid in files:
+            if h:
+                CAT.mark_deleted(h, wp); hashes.add(h)
+        for h in hashes:                                # Ordner-Delete = ganzen Torrent löschen
+            delete_torrent_for_hash(h)
+        lazy_tree_swap()
+        return self._send(204)
     def _get(self, head):
         kind, meta = walk(self.path)
         if kind != "file": return self._send(404)
