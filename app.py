@@ -9,6 +9,7 @@ import concurrent.futures
 from urllib.parse import quote, unquote
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import classify
+from swarm import SegmentSwarm
 
 API_KEY    = os.environ["TORBOX_API_KEY"]
 PORT       = int(os.environ.get("PORT", "8112"))
@@ -62,6 +63,31 @@ WEBDAV_USER = os.environ.get("TORBOX_WEBDAV_USER", "")
 WEBDAV_PASS = os.environ.get("TORBOX_WEBDAV_PASS", "")
 WEBDAV_AUTH = ("Basic " + base64.b64encode(f"{WEBDAV_USER}:{WEBDAV_PASS}".encode()).decode()) if WEBDAV_USER else ""
 NATIVE_TTL  = int(os.environ.get("NATIVE_TTL", "300"))  # nach CDN-Fail X s lang nativ bevorzugen
+
+# Dual-Source-Swarm: CDN (prio 1) + natives WebDAV (prio 2) fuellen ein begrenztes Read-Ahead-
+# Fenster PARALLEL -> Durchsaetze addieren sich; saettigt CDN die Leitung, findet WebDAV keine
+# Arbeit und pausiert von selbst (emergent, KEIN Mbps-Schwellwert). Opt-in via SWARM=1.
+SWARM        = os.environ.get("SWARM", "") == "1"
+SWARM_SEG    = int(float(os.environ.get("SWARM_SEG_MB", "1")) * 1024 * 1024)  # = rclone-Chunk (1 MiB)
+SWARM_WINDOW = int(os.environ.get("SWARM_WINDOW", "24"))   # Segmente Read-Ahead (RAM = WINDOW*SEG je Stream)
+SWARM_MAX    = int(os.environ.get("SWARM_MAX", "2"))       # max gleichzeitige Swarms (RAM-Deckel)
+SWARM_READ_TIMEOUT = float(os.environ.get("SWARM_READ_TIMEOUT", "20"))  # pro read() bevor Fallback
+SWARM_IDLE_S = int(os.environ.get("SWARM_IDLE_SECONDS", "90"))  # idle-Swarm schliessen (Threads/RAM frei)
+# Hedge-Schwelle (WebDAV springt ein, wenn CDN das Kopf-Segment nicht in grace liefert).
+# grace = max(HEDGE_MIN, EWMA(CDN-Segmentzeit) * HEDGE_K) -> selbst-justierend, KEIN fixer Wert.
+SWARM_HEDGE_K      = float(os.environ.get("SWARM_HEDGE_K", "2.0"))        # Sensitivitaet (x CDN-Schnitt)
+SWARM_HEDGE_BOOT   = float(os.environ.get("SWARM_HEDGE_BOOTSTRAP", "1.5"))# Grace beim Kaltstart (s)
+SWARM_HEDGE_MIN    = float(os.environ.get("SWARM_HEDGE_MIN", "0.3"))      # Untergrenze grace (s)
+# Combine: WebDAV fuellt parallel andere Segmente, sobald read() miss_n-mal in Folge auf den Puffer
+# warten musste (CDN < Bedarf) -> Durchsaetze addieren sich. Aus, sobald Puffer wieder >refill_frac tief.
+# Baseline-Tracking (v2): WebDAV-Test nur wenn CDN langsamer als sein Normal (cdn_fast > cdn_slow*K)
+# UND Nachfrage ungedeckt. Half der Test (Skips) -> beide laufen; sonst Cooldown.
+SWARM_REFILL_FRAC  = float(os.environ.get("SWARM_REFILL_FRAC", "0.85"))   # Puffer-Tiefe gilt als gedeckt
+SWARM_DEVIATION    = float(os.environ.get("SWARM_DEVIATION", "1.6"))      # cdn_fast/cdn_slow-Faktor -> degradiert
+SWARM_DEGRADE_PERSIST = float(os.environ.get("SWARM_DEGRADE_PERSIST", "2.0"))  # s anhaltend langsam (Anti-Jitter)
+SWARM_TEST_WINDOW  = float(os.environ.get("SWARM_TEST_WINDOW", "3.0"))    # s WebDAV-Test
+SWARM_COOLDOWN     = float(os.environ.get("SWARM_COOLDOWN", "30.0"))      # s Pause nach nutzlosem Test (Basis)
+SWARM_COOLDOWN_MAX = float(os.environ.get("SWARM_COOLDOWN_MAX", "300.0")) # Backoff-Deckel (schwankende Leitung)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("torbox-webdav")
@@ -119,6 +145,76 @@ def reaper_loop():                 # idle CDN-Streams schliessen (kein fd-Leak)
                         slot["resp"] = None; slot["pos"] = -1
                 finally:
                     slot["lock"].release()
+
+# ── Dual-Source-Swarm-Registry ───────────────────────────────────────────────────────────
+SWARMS = {}            # key -> {"swarm": SegmentSwarm, "size": int, "last": float}
+SWARMS_LOCK = threading.Lock()
+
+def _opener_cdn(meta, key):
+    """Swarm-Quelle CDN: oeffnet einen FORWARD-Stream ab off (offene Verbindung -> Connection-
+    Reuse fuer die ganze Strecke); bei abgelaufener URL (403/410) neu aufloesen."""
+    def open(off):
+        hdr = {"User-Agent": UA, "Range": f"bytes={off}-"}
+        try:
+            return urllib.request.urlopen(urllib.request.Request(cdn_url(meta), headers=hdr),
+                                          timeout=CDN_OPEN_TIMEOUT)
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 410):
+                with CDN_LOCK: CDN_CACHE.pop(key, None)
+                return urllib.request.urlopen(urllib.request.Request(cdn_url(meta), headers=hdr),
+                                              timeout=CDN_OPEN_TIMEOUT)
+            raise
+    return open
+
+def _opener_native(meta):
+    """Swarm-Quelle natives TorBox-WebDAV: Forward-Stream ab off."""
+    def open(off):
+        if not WEBDAV_AUTH:
+            raise RuntimeError("kein WebDAV konfiguriert")
+        u = WEBDAV_BASE + quote("/" + meta.get("wpath", ""))
+        return urllib.request.urlopen(urllib.request.Request(
+            u, headers={"User-Agent": UA, "Authorization": WEBDAV_AUTH,
+                        "Range": f"bytes={off}-"}), timeout=30)
+    return open
+
+def get_swarm(key, meta, size):
+    """Per-Stream-Swarm holen/erzeugen. Deckelt die Zahl gleichzeitiger Swarms (RAM)."""
+    with SWARMS_LOCK:
+        e = SWARMS.get(key)
+        if e is None:
+            while len(SWARMS) >= SWARM_MAX:                # aeltesten schliessen (LRU)
+                ok = min(SWARMS, key=lambda k: SWARMS[k]["last"])
+                try: SWARMS[ok]["swarm"].close()
+                except Exception: pass
+                del SWARMS[ok]
+            srcs = [("cdn", _opener_cdn(meta, key))]
+            if WEBDAV_AUTH:                                # WebDAV als prio-2-Hedge-Quelle dazu
+                srcs.append(("web", _opener_native(meta)))
+            e = {"swarm": SegmentSwarm(size, SWARM_SEG, SWARM_WINDOW, srcs,
+                                       hedge_k=SWARM_HEDGE_K, hedge_bootstrap=SWARM_HEDGE_BOOT,
+                                       hedge_min=SWARM_HEDGE_MIN, refill_frac=SWARM_REFILL_FRAC,
+                                       deviation_factor=SWARM_DEVIATION, test_window_s=SWARM_TEST_WINDOW,
+                                       cooldown_s=SWARM_COOLDOWN, degrade_persist_s=SWARM_DEGRADE_PERSIST,
+                                       cooldown_max_s=SWARM_COOLDOWN_MAX),
+                 "size": size, "last": 0.0}
+            SWARMS[key] = e
+            log.info(f"Swarm gestartet ({len(srcs)} Quellen, Fenster {SWARM_WINDOW}x{SWARM_SEG // 1048576}MiB) "
+                     f"fuer {key}")
+        e["last"] = time.time()
+        return e["swarm"]
+
+def swarm_reaper_loop():           # idle Swarms schliessen (Threads + Fenster-RAM frei)
+    while True:
+        time.sleep(30)
+        now = time.time()
+        with SWARMS_LOCK:
+            dead = [k for k, e in SWARMS.items() if now - e["last"] > SWARM_IDLE_S]
+            for k in dead:
+                try: SWARMS[k]["swarm"].close()
+                except Exception: pass
+                del SWARMS[k]
+        for k in dead:
+            log.info(f"Swarm idle-geschlossen: {k}")
 
 def nest_releases(flat):
     """Flache {release: {fname: meta}} -> verschachtelte {kategorie: {release: {fname: meta}}}
@@ -688,6 +784,30 @@ class H(BaseHTTPRequestHandler):
         # Sequential-Stream-Reuse: zusammenhaengende rclone-Reads laufen ueber EINE offene
         # CDN-Verbindung -> kein Per-Chunk-First-Byte-Overhead -> ~curl-direct-Speed.
         key = (meta["type"], meta["tid"], meta["fid"])
+
+        # Dual-Source-Swarm (opt-in): NUR fuer echte Body-Reads (ausserhalb des head/tail-Probe-
+        # Fensters = Playback, nicht Scan). CDN+WebDAV fuellen das Read-Ahead-Fenster parallel.
+        # Liefert der Swarm rechtzeitig -> ausliefern; sonst Fallback auf Single-Stream unten.
+        if SWARM and not in_probe_window(start, length, size):
+            try:
+                sw = get_swarm(key, meta, size)
+                data = sw.read(start, length, SWARM_READ_TIMEOUT)
+            except Exception as e:
+                log.warning(f"Swarm-Fehler ({type(e).__name__}: {e}) -> Single-Stream-Fallback")
+                data = None
+            if data is not None:
+                sw.advance(start + length)
+                self.send_response(code)
+                for k, v in hdrs.items(): self.send_header(k, v)
+                self.end_headers()
+                try:
+                    self.wfile.write(data)
+                except (BrokenPipeError, ConnectionResetError):
+                    self.close_connection = True
+                alog("swarm", start, length, size, meta.get("wpath"))
+                return
+            log.warning(f"Swarm-Timeout [{start}-{start+length}) {(fname or '')[:38]} -> Single-Stream")
+
         slot = get_stream_slot(key)
         def open_cdn(off):
             try:
@@ -782,5 +902,12 @@ if __name__ == "__main__":
             log.info("Warmer AKTIV — waermt head/tail aller present Files vor")
     threading.Thread(target=refresh_loop, daemon=True).start()
     threading.Thread(target=reaper_loop, daemon=True).start()
+    if SWARM:
+        threading.Thread(target=swarm_reaper_loop, daemon=True).start()
+        log.info(f"Hybrid-Swarm AKTIV — CDN prio1 + WebDAV prio2 (lazy): Failover-Hedge bei Stall "
+                 f"(grace=max({SWARM_HEDGE_MIN}s, EWMA*{SWARM_HEDGE_K})) + Baseline-Combine-Test bei "
+                 f"CDN-Deviation>{SWARM_DEVIATION}x fuer {SWARM_DEGRADE_PERSIST}s (Test {SWARM_TEST_WINDOW}s, "
+                 f"Cooldown {SWARM_COOLDOWN}->{SWARM_COOLDOWN_MAX}s Backoff); "
+                 f"Fenster {SWARM_WINDOW}x{SWARM_SEG // 1048576}MiB, max {SWARM_MAX} Streams")
     log.info(f"torbox-webdav laeuft auf :{PORT}")
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()
