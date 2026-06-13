@@ -238,7 +238,7 @@ class SegmentSwarm:
     ALPHA_SLOW = 0.05    # lange Zeitskala (Baseline "normal")
 
     def __init__(self, size, seg_size, window, sources,
-                 hedge_k=2.0, hedge_bootstrap=1.0, hedge_min=0.05, refill_frac=0.85,
+                 hedge_k=2.0, cold_grace_s=0.3, hedge_min=0.05, refill_frac=0.85,
                  deviation_factor=1.6, test_window_s=3.0, cooldown_s=30.0, degrade_persist_s=2.0,
                  cooldown_max_s=300.0):
         self.size = size
@@ -252,7 +252,10 @@ class SegmentSwarm:
         self.starved = False             # read() haengt hart am Kopf-Segment -> Hedge (Kopf mitziehen)
         self.hedge_k = hedge_k
         self.hedge_min = hedge_min
-        self.hedge_bootstrap = hedge_bootstrap
+        # Kaltstart-Grace: solange CDN noch ungemessen ist (cdn_ewma None), nach so kurzer Zeit schon
+        # WebDAV mitrennen lassen. CDN ist kalt oft 3-38s (Edge-Provisioning), WebDAV stabil ~2s ->
+        # der Schnellere gewinnt den Kopf, CDN uebernimmt danach den Durchsatz.
+        self.cold_grace_s = cold_grace_s
         # PLOW-vs-SKIP-Schwelle: cdn_ewma = Steady-Segmentzeit (ohne TTFB), cdn_ttfb = 1. Read je Run.
         self.cdn_ewma = None
         self.cdn_ttfb = None
@@ -286,8 +289,9 @@ class SegmentSwarm:
             self.threads.append(t)
 
     def _grace(self):
-        cdn = self.cdn_ewma if self.cdn_ewma is not None else self.hedge_bootstrap
-        return max(self.hedge_min, cdn * self.hedge_k)
+        if self.cdn_ewma is None:
+            return self.cold_grace_s                 # Kaltstart: WebDAV sofort mitrennen (racet CDN)
+        return max(self.hedge_min, self.cdn_ewma * self.hedge_k)
 
     def _engaged(self):
         return self.starved or self.combine_active

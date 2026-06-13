@@ -65,7 +65,7 @@ def test_cdn_outage_caught_by_webdav():
     s = SegmentSwarm(size=len(blob), seg_size=SEG, window=8,
                      sources=[flaky(blob, "cdn", lambda x: 10 <= x <= 20, bcnt=bcnt),
                               flaky(blob, "web", lambda x: False, bcnt=bcnt)],
-                     hedge_bootstrap=0.05, hedge_k=1.0, hedge_min=0.02)
+                     cold_grace_s=0.05, hedge_k=1.0, hedge_min=0.02)
     assert drain(s, blob) == blob, "CDN-Ausfall: Datei exakt rekonstruiert"
     assert bcnt.get("web", 0) > 0, "WebDAV hat die CDN-Luecke aufgefangen"
     assert bcnt.get("cdn", 0) > 0, "CDN hat vor/nach dem Ausfall geliefert"
@@ -79,7 +79,7 @@ def test_intermittent_cdn_flaps():
     s = SegmentSwarm(size=len(blob), seg_size=SEG, window=6,
                      sources=[flaky(blob, "cdn", lambda x: x in flap),
                               flaky(blob, "web", lambda x: False)],
-                     hedge_bootstrap=0.05, hedge_k=1.0, hedge_min=0.02)
+                     cold_grace_s=0.05, hedge_k=1.0, hedge_min=0.02)
     assert drain(s, blob) == blob, "CDN-Flapping: Datei exakt rekonstruiert"
     s.close()
 
@@ -91,7 +91,7 @@ def test_webdav_dead_is_harmless_for_healthy_cdn():
     s = SegmentSwarm(size=len(blob), seg_size=SEG, window=8,
                      sources=[flaky(blob, "cdn", lambda x: False, bcnt=bcnt),
                               flaky(blob, "web", lambda x: True, bcnt=bcnt)],  # web immer tot
-                     hedge_bootstrap=0.5, hedge_k=2.0)
+                     cold_grace_s=0.5, hedge_k=2.0)
     assert drain(s, blob) == blob, "WebDAV tot: gesunder CDN-Stream unbeeintraechtigt"
     assert bcnt.get("web", 0) == 0, "toter WebDAV hat nichts geliefert (war nie noetig)"
     s.close()
@@ -105,7 +105,7 @@ def test_alternating_outages_each_covers_the_other():
     s = SegmentSwarm(size=len(blob), seg_size=SEG, window=6,
                      sources=[flaky(blob, "cdn", lambda x: 8 <= x <= 14, delay=0.0, bcnt=bcnt),
                               flaky(blob, "web", lambda x: 22 <= x <= 27, bcnt=bcnt)],
-                     hedge_bootstrap=0.05, hedge_k=1.0, hedge_min=0.02)
+                     cold_grace_s=0.05, hedge_k=1.0, hedge_min=0.02)
     assert drain(s, blob) == blob, "wechselnde Ausfaelle: Datei exakt rekonstruiert"
     assert bcnt.get("web", 0) > 0 and bcnt.get("cdn", 0) > 0, "beide haben beigetragen"
     s.close()

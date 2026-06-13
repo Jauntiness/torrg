@@ -63,7 +63,7 @@ def test_correctness():
     s = SegmentSwarm(size=len(blob), seg_size=4, window=16,
                      sources=[make_opener(blob, "cdn", delay=0.001),
                               make_opener(blob, "web", delay=0.001)],
-                     hedge_bootstrap=0.5)
+                     cold_grace_s=0.5)
     assert drain(s, blob) == blob, "rekonstruierte Datei stimmt exakt"
     s.close()
 
@@ -76,7 +76,7 @@ def test_lazy_no_overhead_when_cdn_healthy():
     s = SegmentSwarm(size=len(blob), seg_size=4, window=32,
                      sources=[make_opener(blob, "cdn", delay=0.002, opens=opens),
                               make_opener(blob, "web", delay=0.002, opens=opens)],
-                     hedge_bootstrap=0.5, hedge_k=2.0)
+                     cold_grace_s=0.5, hedge_k=2.0)
     assert drain(s, blob, pace=0.02) == blob
     s.close()
     assert opens.get("web", 0) == 0, f"WebDAV lief obwohl CDN gesund ({opens})"
@@ -90,7 +90,7 @@ def test_secondary_rescues_slow_cdn():
     s = SegmentSwarm(size=len(blob), seg_size=4, window=8,
                      sources=[make_opener(blob, "cdn", delay=0.30, opens=opens, bcnt=bcnt),
                               make_opener(blob, "web", delay=0.01, opens=opens, bcnt=bcnt)],
-                     hedge_bootstrap=0.05, hedge_k=1.0, hedge_min=0.02)
+                     cold_grace_s=0.05, hedge_k=1.0, hedge_min=0.02)
     t0 = time.monotonic()
     out = drain(s, blob)
     dt = time.monotonic() - t0
@@ -101,10 +101,46 @@ def test_secondary_rescues_slow_cdn():
     assert dt < 6.0, f"Rescue war nicht schnell genug ({dt:.1f}s)"
 
 
+class SlowFirstReader:
+    """Erster Read teuer (kalter CDN-Edge-Spike), danach schnell."""
+    def __init__(self, blob, off, first_delay, name, bcnt):
+        self.blob, self.pos, self.fd, self.name, self.bcnt, self.first = blob, off, first_delay, name, bcnt, True
+
+    def read(self, n):
+        if self.first:
+            time.sleep(self.fd); self.first = False
+        d = self.blob[self.pos:self.pos + n]
+        self.pos += len(d)
+        if self.bcnt is not None:
+            self.bcnt[self.name] = self.bcnt.get(self.name, 0) + len(d)
+        return d
+
+    def close(self):
+        pass
+
+
+def test_cold_start_races_webdav():
+    # Kalter CDN: 1. Byte erst nach 3s (Edge-Provisioning). WebDAV schnell. Der Start darf NICHT auf
+    # den langsamen CDN warten -> WebDAV rennt nach cold_grace mit und liefert den Kopf.
+    blob = bytes((i * 9) % 256 for i in range(20 * 4))
+    bcnt = {}
+    s = SegmentSwarm(size=len(blob), seg_size=4, window=8,
+                     sources=[("cdn", lambda off: SlowFirstReader(blob, off, 3.0, "cdn", bcnt)),
+                              ("web", lambda off: SlowFirstReader(blob, off, 0.02, "web", bcnt))],
+                     cold_grace_s=0.3)
+    t0 = time.monotonic()
+    chunk = s.read(0, 4, timeout=10)
+    dt = time.monotonic() - t0
+    s.close()
+    assert chunk == blob[0:4], "Kopf korrekt geliefert"
+    assert dt < 1.5, f"Start hat auf den kalten CDN gewartet statt WebDAV zu racen ({dt:.2f}s)"
+    assert bcnt.get("web", 0) > 0, "WebDAV hat den Start nicht abgefangen"
+
+
 def test_seek():
     blob = bytes(range(256)) * 4
     s = SegmentSwarm(size=len(blob), seg_size=16, window=4,
-                     sources=[make_opener(blob, "cdn")], hedge_bootstrap=0.5)
+                     sources=[make_opener(blob, "cdn")], cold_grace_s=0.5)
     assert s.read(512, 16, timeout=5) == blob[512:528], "Seek vorwaerts"
     assert s.read(0, 16, timeout=5) == blob[0:16], "Seek zurueck"
     assert s.read(600, 16, timeout=5) == blob[600:616], "unaligned Seek"
@@ -113,7 +149,7 @@ def test_seek():
 
 def test_timeout_all_fail():
     s = SegmentSwarm(size=64, seg_size=16, window=2,
-                     sources=[make_opener(b"x" * 64, "cdn", fail=True)], hedge_bootstrap=0.05)
+                     sources=[make_opener(b"x" * 64, "cdn", fail=True)], cold_grace_s=0.05)
     assert s.read(0, 16, timeout=0.4) is None, "permanent failende Quelle -> read None (kein Hang)"
     s.close()
 
@@ -122,9 +158,10 @@ def main():
     test_correctness()
     test_lazy_no_overhead_when_cdn_healthy()
     test_secondary_rescues_slow_cdn()
+    test_cold_start_races_webdav()
     test_seek()
     test_timeout_all_fail()
-    print("OK: SegmentSwarm hybrid — correctness + lazy/no-overhead + rescue + seek + timeout")
+    print("OK: SegmentSwarm hybrid — correctness + lazy/no-overhead + rescue + cold-start-race + seek + timeout")
 
 
 if __name__ == "__main__":

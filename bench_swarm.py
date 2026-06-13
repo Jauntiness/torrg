@@ -98,7 +98,7 @@ def bench_swarm(meta, url, start, total):
     srcs = [("cdn", wrap("cdn", opener_cdn(url))),
             ("web", wrap("web", opener_native(meta["wpath"], auth)))]
     sw = SegmentSwarm(meta["size"], SEG, WINDOW, srcs,
-                      hedge_k=2.0, hedge_bootstrap=1.5, hedge_min=0.3)
+                      hedge_k=2.0, cold_grace_s=0.3, hedge_min=0.3)
     t0 = time.monotonic()
     pos = start
     got = 0

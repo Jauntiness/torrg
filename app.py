@@ -76,8 +76,10 @@ SWARM_IDLE_S = int(os.environ.get("SWARM_IDLE_SECONDS", "90"))  # idle-Swarm sch
 # Hedge-Schwelle (WebDAV springt ein, wenn CDN das Kopf-Segment nicht in grace liefert).
 # grace = max(HEDGE_MIN, EWMA(CDN-Segmentzeit) * HEDGE_K) -> selbst-justierend, KEIN fixer Wert.
 SWARM_HEDGE_K      = float(os.environ.get("SWARM_HEDGE_K", "2.0"))        # Sensitivitaet (x CDN-Schnitt)
-SWARM_HEDGE_BOOT   = float(os.environ.get("SWARM_HEDGE_BOOTSTRAP", "1.5"))# Grace beim Kaltstart (s)
-SWARM_HEDGE_MIN    = float(os.environ.get("SWARM_HEDGE_MIN", "0.3"))      # Untergrenze grace (s)
+# Kaltstart-Grace: solange CDN ungemessen (1. Read), nach so kurzer Zeit schon WebDAV mitrennen
+# lassen (CDN kalt 3-38s Edge-Provisioning, WebDAV stabil ~2s -> Schnellerer gewinnt den Start).
+SWARM_COLD_GRACE   = float(os.environ.get("SWARM_COLD_GRACE", "0.3"))     # Grace beim 1. Read (s)
+SWARM_HEDGE_MIN    = float(os.environ.get("SWARM_HEDGE_MIN", "0.3"))      # Untergrenze grace warm (s)
 # Combine: WebDAV fuellt parallel andere Segmente, sobald read() miss_n-mal in Folge auf den Puffer
 # warten musste (CDN < Bedarf) -> Durchsaetze addieren sich. Aus, sobald Puffer wieder >refill_frac tief.
 # Baseline-Tracking (v2): WebDAV-Test nur wenn CDN langsamer als sein Normal (cdn_fast > cdn_slow*K)
@@ -191,7 +193,7 @@ def get_swarm(key, meta, size):
             if WEBDAV_AUTH:                                # WebDAV als prio-2-Hedge-Quelle dazu
                 srcs.append(("web", _opener_native(meta)))
             e = {"swarm": SegmentSwarm(size, SWARM_SEG, SWARM_WINDOW, srcs,
-                                       hedge_k=SWARM_HEDGE_K, hedge_bootstrap=SWARM_HEDGE_BOOT,
+                                       hedge_k=SWARM_HEDGE_K, cold_grace_s=SWARM_COLD_GRACE,
                                        hedge_min=SWARM_HEDGE_MIN, refill_frac=SWARM_REFILL_FRAC,
                                        deviation_factor=SWARM_DEVIATION, test_window_s=SWARM_TEST_WINDOW,
                                        cooldown_s=SWARM_COOLDOWN, degrade_persist_s=SWARM_DEGRADE_PERSIST,
@@ -904,8 +906,8 @@ if __name__ == "__main__":
     threading.Thread(target=reaper_loop, daemon=True).start()
     if SWARM:
         threading.Thread(target=swarm_reaper_loop, daemon=True).start()
-        log.info(f"Hybrid-Swarm AKTIV — CDN prio1 + WebDAV prio2 (lazy): Failover-Hedge bei Stall "
-                 f"(grace=max({SWARM_HEDGE_MIN}s, EWMA*{SWARM_HEDGE_K})) + Baseline-Combine-Test bei "
+        log.info(f"Hybrid-Swarm AKTIV — CDN prio1 + WebDAV prio2 (lazy): Kaltstart-Race ({SWARM_COLD_GRACE}s) "
+                 f"+ Failover-Hedge bei Stall (grace=max({SWARM_HEDGE_MIN}s, EWMA*{SWARM_HEDGE_K})) + Baseline-Combine-Test bei "
                  f"CDN-Deviation>{SWARM_DEVIATION}x fuer {SWARM_DEGRADE_PERSIST}s (Test {SWARM_TEST_WINDOW}s, "
                  f"Cooldown {SWARM_COOLDOWN}->{SWARM_COOLDOWN_MAX}s Backoff); "
                  f"Fenster {SWARM_WINDOW}x{SWARM_SEG // 1048576}MiB, max {SWARM_MAX} Streams")
