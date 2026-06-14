@@ -10,6 +10,7 @@ from urllib.parse import quote, unquote
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import classify
 from swarm import SegmentSwarm
+from lightstream import LightSlot
 
 API_KEY    = os.environ["TORBOX_API_KEY"]
 PORT       = int(os.environ.get("PORT", "8112"))
@@ -67,10 +68,14 @@ NATIVE_TTL  = int(os.environ.get("NATIVE_TTL", "300"))  # nach CDN-Fail X s lang
 # Dual-Source-Swarm: CDN (prio 1) + natives WebDAV (prio 2) fuellen ein begrenztes Read-Ahead-
 # Fenster PARALLEL -> Durchsaetze addieren sich; saettigt CDN die Leitung, findet WebDAV keine
 # Arbeit und pausiert von selbst (emergent, KEIN Mbps-Schwellwert). Opt-in via SWARM=1.
+# DEPRECATED: Der SWARM-immer-an-Pfad ist seit 2026-06-14 durch LIGHTSTREAM abgeloest (Default).
+# Die Mechanik (SegmentSwarm) lebt als Heavy-on-demand weiter; der *immer-an*-Block (get_swarm,
+# swarm_reaper_loop, SWARM_MAX + der _get-Block unten) bleibt vorerst als per SWARM=1 aktivierbarer
+# Fallback erhalten und wird ENTFERNT, sobald LIGHTSTREAM dauerhaft verifiziert ist.
 SWARM        = os.environ.get("SWARM", "") == "1"
 SWARM_SEG    = int(float(os.environ.get("SWARM_SEG_MB", "1")) * 1024 * 1024)  # = rclone-Chunk (1 MiB)
 SWARM_WINDOW = int(os.environ.get("SWARM_WINDOW", "24"))   # Segmente Read-Ahead (RAM = WINDOW*SEG je Stream)
-SWARM_MAX    = int(os.environ.get("SWARM_MAX", "2"))       # max gleichzeitige Swarms (RAM-Deckel)
+SWARM_MAX    = int(os.environ.get("SWARM_MAX", "2"))       # max gleichzeitige Swarms (RAM-Deckel) — DEPRECATED: nur SWARM=1-Fallback; LIGHTSTREAM nutzt SWARM_RAM_BUDGET. Mit dem SWARM-Block entfernen.
 SWARM_READ_TIMEOUT = float(os.environ.get("SWARM_READ_TIMEOUT", "20"))  # pro read() bevor Fallback
 SWARM_IDLE_S = int(os.environ.get("SWARM_IDLE_SECONDS", "90"))  # idle-Swarm schliessen (Threads/RAM frei)
 # Hedge-Schwelle (WebDAV springt ein, wenn CDN das Kopf-Segment nicht in grace liefert).
@@ -90,6 +95,19 @@ SWARM_DEGRADE_PERSIST = float(os.environ.get("SWARM_DEGRADE_PERSIST", "2.0"))  #
 SWARM_TEST_WINDOW  = float(os.environ.get("SWARM_TEST_WINDOW", "3.0"))    # s WebDAV-Test
 SWARM_COOLDOWN     = float(os.environ.get("SWARM_COOLDOWN", "30.0"))      # s Pause nach nutzlosem Test (Basis)
 SWARM_COOLDOWN_MAX = float(os.environ.get("SWARM_COOLDOWN_MAX", "300.0")) # Backoff-Deckel (schwankende Leitung)
+
+# Light-by-default (REV 2, siehe DESIGN_lightstream.md): gesunder Stream = EINE Verbindung,
+# synchron im Handler-Thread, KEINE per-Stream-Dauer-Threads -> skaliert auf viele Streams.
+# Eskaliert EINSEITIG auf den (schweren) SegmentSwarm erst bei anhaltendem Stall, gedeckelt per
+# RAM-Budget. Opt-in via LIGHTSTREAM=1 (ersetzt langfristig den SWARM-immer-an-Pfad).
+LIGHTSTREAM       = os.environ.get("LIGHTSTREAM", "") == "1"
+LIGHT_CHUNK       = int(float(os.environ.get("LIGHT_CHUNK_KB", "256")) * 1024)  # Sub-Read an wfile
+LIGHT_COLD_GRACE  = float(os.environ.get("LIGHT_COLD_GRACE", str(SWARM_COLD_GRACE)))  # Kaltstart-Hedge
+LIGHT_GRACE       = float(os.environ.get("LIGHT_GRACE", "0.8"))   # Sub-Read langsamer -> GET "slow"
+LIGHT_ESCALATE_N  = int(os.environ.get("LIGHT_ESCALATE_N", "4"))  # Stalls in Folge -> Heavy
+LIGHT_READ_TIMEOUT = float(os.environ.get("LIGHT_READ_TIMEOUT", "30"))  # pro Sub-Read bevor Fallback
+LIGHT_IDLE_S      = int(os.environ.get("LIGHT_IDLE_SECONDS", "180"))  # idle Light-Slot verwerfen
+SWARM_RAM_BUDGET  = int(float(os.environ.get("SWARM_RAM_BUDGET_MB", "512")) * 1024 * 1024)  # Heavy-Deckel
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("torbox-webdav")
@@ -180,7 +198,9 @@ def _opener_native(meta):
     return open
 
 def get_swarm(key, meta, size):
-    """Per-Stream-Swarm holen/erzeugen. Deckelt die Zahl gleichzeitiger Swarms (RAM)."""
+    """Per-Stream-Swarm holen/erzeugen (SWARM-immer-an). Deckelt die Zahl gleichzeitiger Swarms (RAM).
+    DEPRECATED: nur noch fuer den SWARM=1-Fallback; LIGHTSTREAM erzeugt Heavy on-demand via _make_heavy.
+    ENTFERNEN (samt swarm_reaper_loop + SWARM_MAX), sobald LIGHTSTREAM verifiziert ist."""
     with SWARMS_LOCK:
         e = SWARMS.get(key)
         if e is None:
@@ -205,7 +225,7 @@ def get_swarm(key, meta, size):
         e["last"] = time.time()
         return e["swarm"]
 
-def swarm_reaper_loop():           # idle Swarms schliessen (Threads + Fenster-RAM frei)
+def swarm_reaper_loop():           # idle Swarms schliessen (Threads + Fenster-RAM frei) — DEPRECATED: nur SWARM=1-Fallback (LIGHTSTREAM: light_reaper_loop). Mit dem SWARM-Block entfernen.
     while True:
         time.sleep(30)
         now = time.time()
@@ -217,6 +237,88 @@ def swarm_reaper_loop():           # idle Swarms schliessen (Threads + Fenster-R
                 del SWARMS[k]
         for k in dead:
             log.info(f"Swarm idle-geschlossen: {k}")
+
+# ── Light-Slot-Registry (LIGHTSTREAM=1) ──────────────────────────────────────────────────
+# Light = 1 Verbindung, synchron, keine Dauer-Threads. Eskaliert einseitig auf SegmentSwarm
+# (Heavy) erst bei anhaltendem Stall, gedeckelt per RAM-Budget (HEAVY_BYTES vs SWARM_RAM_BUDGET).
+LIGHT_SLOTS = {}       # key -> {"slot": LightSlot, "last": float}
+LIGHT_LOCK  = threading.Lock()
+HEAVY_BYTES = 0        # aktuell durch Heavy-Swarms reservierter Fenster-RAM
+HEAVY_LOCK  = threading.Lock()
+
+class _HeavyAdapter:
+    """Macht den SegmentSwarm zur LightSlot-Heavy-Quelle: read()+advance() in einem, und gibt
+    beim close() das reservierte RAM-Budget wieder frei."""
+    def __init__(self, swarm, reserved):
+        self.swarm, self.reserved, self._closed = swarm, reserved, False
+
+    def read(self, start, length, timeout):
+        data = self.swarm.read(start, length, timeout)
+        if data is not None:
+            self.swarm.advance(start + length)
+        return data
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        try: self.swarm.close()
+        except Exception: pass
+        global HEAVY_BYTES
+        with HEAVY_LOCK:
+            HEAVY_BYTES -= self.reserved
+
+def _make_heavy(meta, key, size, fname):
+    """Factory fuer LightSlot: baut bei Eskalation einen SegmentSwarm ab pos — oder None, wenn
+    das RAM-Budget voll ist (dann bleibt der Stream light)."""
+    def make_heavy(pos):
+        global HEAVY_BYTES
+        reserved = SWARM_WINDOW * SWARM_SEG
+        with HEAVY_LOCK:
+            if HEAVY_BYTES + reserved > SWARM_RAM_BUDGET:
+                log.info(f"Heavy-Budget voll ({HEAVY_BYTES // 1048576}/{SWARM_RAM_BUDGET // 1048576}MiB) "
+                         f"-> Stream bleibt light: {(fname or '')[:38]}")
+                return None
+            HEAVY_BYTES += reserved
+        srcs = [("cdn", _opener_cdn(meta, key))]
+        if WEBDAV_AUTH:
+            srcs.append(("web", _opener_native(meta)))
+        sw = SegmentSwarm(size, SWARM_SEG, SWARM_WINDOW, srcs,
+                          hedge_k=SWARM_HEDGE_K, cold_grace_s=SWARM_COLD_GRACE,
+                          hedge_min=SWARM_HEDGE_MIN, refill_frac=SWARM_REFILL_FRAC,
+                          deviation_factor=SWARM_DEVIATION, test_window_s=SWARM_TEST_WINDOW,
+                          cooldown_s=SWARM_COOLDOWN, degrade_persist_s=SWARM_DEGRADE_PERSIST,
+                          cooldown_max_s=SWARM_COOLDOWN_MAX)
+        log.info(f"Light->Heavy Eskalation @ {pos // 1048576}MiB ({len(srcs)} Quellen, "
+                 f"Fenster {SWARM_WINDOW}x{SWARM_SEG // 1048576}MiB): {(fname or '')[:38]}")
+        return _HeavyAdapter(sw, reserved)
+    return make_heavy
+
+def get_light_slot(key, meta, size, fname):
+    with LIGHT_LOCK:
+        e = LIGHT_SLOTS.get(key)
+        if e is None:
+            slot = LightSlot(_opener_cdn(meta, key),
+                             _opener_native(meta) if WEBDAV_AUTH else None,
+                             cold_grace_s=LIGHT_COLD_GRACE, grace_s=LIGHT_GRACE,
+                             escalate_n=LIGHT_ESCALATE_N, make_heavy=_make_heavy(meta, key, size, fname))
+            e = {"slot": slot, "last": 0.0}
+            LIGHT_SLOTS[key] = e
+        e["last"] = time.time()
+        return e["slot"]
+
+def light_reaper_loop():           # idle Light-Slots verwerfen (Verbindung + evtl. Heavy frei)
+    while True:
+        time.sleep(30)
+        now = time.time()
+        with LIGHT_LOCK:
+            dead = [k for k, e in LIGHT_SLOTS.items() if now - e["last"] > LIGHT_IDLE_S]
+            slots = [LIGHT_SLOTS.pop(k)["slot"] for k in dead]
+        for s in slots:
+            try: s.close()
+            except Exception: pass
+        for k in dead:
+            log.info(f"Light-Slot idle-verworfen: {k}")
 
 def nest_releases(flat):
     """Flache {release: {fname: meta}} -> verschachtelte {kategorie: {release: {fname: meta}}}
@@ -802,7 +904,8 @@ class H(BaseHTTPRequestHandler):
         # CDN-Verbindung -> kein Per-Chunk-First-Byte-Overhead -> ~curl-direct-Speed.
         key = (meta["type"], meta["tid"], meta["fid"])
 
-        # Dual-Source-Swarm (opt-in): NUR fuer echte Body-Reads (ausserhalb des head/tail-Probe-
+        # DEPRECATED (per SWARM=1 aktivierbarer Fallback, ENTFERNEN nach LIGHTSTREAM-Verifikation):
+        # Dual-Source-Swarm-immer-an. NUR fuer echte Body-Reads (ausserhalb des head/tail-Probe-
         # Fensters = Playback, nicht Scan). CDN+WebDAV fuellen das Read-Ahead-Fenster parallel.
         # Liefert der Swarm rechtzeitig -> ausliefern; sonst Fallback auf Single-Stream unten.
         if SWARM and not in_probe_window(start, length, size):
@@ -824,6 +927,32 @@ class H(BaseHTTPRequestHandler):
                 alog("swarm", start, length, size, meta.get("wpath"))
                 return
             log.warning(f"Swarm-Timeout [{start}-{start+length}) {(fname or '')[:38]} -> Single-Stream")
+
+        # Light-by-default (opt-in): 1 Verbindung, synchron in Sub-Chunks an wfile, eskaliert
+        # einseitig auf Heavy bei anhaltendem Stall. None vom 1. Read -> Single-Stream-Fallback unten.
+        if LIGHTSTREAM and not in_probe_window(start, length, size):
+            lslot = get_light_slot(key, meta, size, fname)
+            first = lslot.read(start, min(LIGHT_CHUNK, length), LIGHT_READ_TIMEOUT)
+            if first is not None:
+                self.send_response(code)
+                for k, v in hdrs.items(): self.send_header(k, v)
+                self.end_headers()
+                pos, remaining = start + len(first), length - len(first)
+                try:
+                    self.wfile.write(first)
+                    while remaining > 0:
+                        d = lslot.read(pos, min(LIGHT_CHUNK, remaining), LIGHT_READ_TIMEOUT)
+                        if d is None:                     # Stall/Truncation mid-stream -> Client retryt
+                            self.close_connection = True
+                            break
+                        self.wfile.write(d)
+                        pos += len(d); remaining -= len(d)
+                except (BrokenPipeError, ConnectionResetError):
+                    self.close_connection = True
+                alog("heavy" if lslot.mode == "heavy" else "light",
+                     start, length - remaining, size, meta.get("wpath"))
+                return
+            log.warning(f"Light-Slot kein Start [{start}-{start+length}) {(fname or '')[:38]} -> Single-Stream")
 
         slot = get_stream_slot(key)
         def open_cdn(off):
@@ -919,6 +1048,12 @@ if __name__ == "__main__":
             log.info("Warmer AKTIV — waermt head/tail aller present Files vor")
     threading.Thread(target=refresh_loop, daemon=True).start()
     threading.Thread(target=reaper_loop, daemon=True).start()
+    if LIGHTSTREAM:
+        threading.Thread(target=light_reaper_loop, daemon=True).start()
+        log.info(f"LIGHTSTREAM AKTIV — 1 Verbindung/Stream synchron (Kaltstart-Hedge {LIGHT_COLD_GRACE}s), "
+                 f"einseitige Eskalation auf Heavy nach {LIGHT_ESCALATE_N} Stalls (>{LIGHT_GRACE}s/"
+                 f"{LIGHT_CHUNK // 1024}KiB), Heavy-Budget {SWARM_RAM_BUDGET // 1048576}MiB, "
+                 f"idle-release {LIGHT_IDLE_S}s")
     if SWARM:
         threading.Thread(target=swarm_reaper_loop, daemon=True).start()
         log.info(f"Hybrid-Swarm AKTIV — CDN prio1 + WebDAV prio2 (lazy): Kaltstart-Race ({SWARM_COLD_GRACE}s) "
