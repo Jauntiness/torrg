@@ -678,6 +678,18 @@ class H(BaseHTTPRequestHandler):
     def handle(self):                       # rclone schliesst keep-alive-Verbindungen -> harmlos, nicht tracen
         try: super().handle()
         except (ConnectionResetError, BrokenPipeError): pass
+    def _drain_body(self):
+        """Request-Body lesen+verwerfen. PFLICHT bei HTTP/1.1-Keep-Alive: rclones PROPFIND schickt
+        einen XML-Body; bleibt der ungelesen, liest der naechste Request auf derselben Verbindung
+        den '<?xml...'-Body als Request-Zeile -> 400 -> rclone-Pool desynct -> Stream haengt."""
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            n = 0
+        while n > 0:
+            chunk = self.rfile.read(min(65536, n))
+            if not chunk: break
+            n -= len(chunk)
     def _send(self, code, hdrs=None, body=b""):
         self.send_response(code)
         hdrs = hdrs or {}
@@ -686,14 +698,17 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         if body and self.command != "HEAD": self.wfile.write(body)
     def do_OPTIONS(self):
+        self._drain_body()
         self._send(200, {"DAV": "1,2", "Allow": "OPTIONS, GET, HEAD, PROPFIND, DELETE", "MS-Author-Via": "DAV"})
     def do_PROPFIND(self):
+        self._drain_body()
         body = propfind_body(self.path, self.headers.get("Depth", "1"))
         if body is None: return self._send(404)
         self._send(207, {"Content-Type": 'application/xml; charset="utf-8"'}, body)
     def do_HEAD(self): self._get(head=True)
     def do_GET(self):  self._get(head=False)
     def do_DELETE(self):
+        self._drain_body()
         # Per-File-Emulation (siehe TORBOX_CONTROL-Block). Nur sinnvoll mit Katalog (LAZY).
         if not (LAZY and CAT is not None):
             return self._send(405)
